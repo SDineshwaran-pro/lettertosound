@@ -1,0 +1,5 @@
+streamlit>=1.32.0
+edge-tts>=6.1.9
+gTTS>=2.5.1
+pyttsx3>=2.90
+pydub>=0.25.1
