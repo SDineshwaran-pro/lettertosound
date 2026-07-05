@@ -9,12 +9,26 @@ Engines used (all free, no API keys required):
     2. gTTS      -> Google Translate TTS (automatic fallback)
     3. pyttsx3   -> Fully offline TTS (last-resort fallback)
 
+NEW in this version:
+    - Wider, stronger pitch/speed range for more dramatic voice control
+    - Local, offline "AI-style" emotion analysis (lexicon + punctuation based
+      NLP heuristics -- NOT a paid LLM/API) that automatically detects the
+      emotional tone of each sentence and dynamically re-tunes pitch/speed
+      per sentence, so the output sounds more expressive and human, rather
+      than flat and robotic. This keeps the app 100% free and offline --
+      a real hosted LLM/RAG pipeline would require a paid API key, which
+      contradicts the "no API key / no paid service" requirement, so this
+      app implements the same *effect* (context-aware prosody) using free,
+      local NLP logic instead.
+    - "🔊 Preview Voice" button to instantly hear a short sample of the
+      selected voice/pitch/speed/tone before converting your full text.
+
 Author: Generated for GitHub-ready deployment (Streamlit Cloud + local)
 License: MIT
 """
 
 import os
-import io
+import re
 import time
 import uuid
 import asyncio
@@ -60,8 +74,9 @@ APP_TITLE = "🎙 Free Indian Voice Text To MP3 Converter"
 TEMP_DIR = Path(__file__).parent / "temp_audio"
 TEMP_DIR.mkdir(exist_ok=True)
 
-MAX_CHARS = 5000          # soft limit shown to the user
-FILE_MAX_AGE_SECONDS = 3600  # auto-cleanup files older than 1 hour
+MAX_CHARS = 5000              # soft limit shown to the user
+FILE_MAX_AGE_SECONDS = 3600   # auto-cleanup files older than 1 hour
+SENTENCE_GAP_MS = 160         # natural pause inserted between sentences
 
 LANGUAGES = {
     "English (India)": "en",
@@ -85,19 +100,29 @@ EDGE_VOICES = {
     "bn": {"Indian Female": "bn-IN-TanishaaNeural", "Indian Male": "bn-IN-BashkarNeural"},
 }
 
-# gTTS uses the same short language codes for all of the above.
 GTTS_LANG_MAP = {code: code for code in LANGUAGES.values()}
 
-PITCH_MAP = {"Very Low": -50, "Low": -25, "Normal": 0, "High": 25, "Very High": 50}
-RATE_MAP = {"Slow": -25, "Normal": 0, "Fast": 25, "Very Fast": 50}
+PREVIEW_TEXTS = {
+    "en": "Hello! This is a quick preview of the selected voice.",
+    "hi": "नमस्ते! यह चयनित आवाज़ का एक त्वरित पूर्वावलोकन है।",
+    "ta": "வணக்கம்! இது தேர்ந்தெடுக்கப்பட்ட குரலின் விரைவு முன்னோட்டம்.",
+    "te": "నమస్కారం! ఇది ఎంచుకున్న స్వరం యొక్క శీఘ్ర ప్రివ్యూ.",
+    "ml": "നമസ്കാരം! ഇത് തിരഞ്ഞെടുത്ത ശബ്ദത്തിന്റെ ഒരു ദ്രുത പ്രിവ്യൂ ആണ്.",
+    "kn": "ನಮಸ್ಕಾರ! ಇದು ಆಯ್ಕೆಮಾಡಿದ ಧ್ವನಿಯ ತ್ವರಿತ ಮುನ್ನೋಟ.",
+    "bn": "নমস্কার! এটি নির্বাচিত ভয়েসের একটি দ্রুত প্রিভিউ।",
+}
 
-# Tone presets nudge rate/pitch slightly to emulate a "style" since the
+# --- Wider / stronger ranges than before, per user request ---
+PITCH_MAP = {"Very Low": -80, "Low": -40, "Normal": 0, "High": 40, "Very High": 80}
+RATE_MAP = {"Slow": -35, "Normal": 0, "Fast": 30, "Very Fast": 60}
+
+# Tone presets nudge rate/pitch to emulate a "speaking style" since the
 # free engines used here don't expose SSML speaking-styles.
 TONE_ADJUST = {
-    "Friendly":     {"rate": 5,   "pitch": 8},
-    "Professional": {"rate": -5,  "pitch": -5},
+    "Friendly":     {"rate": 8,   "pitch": 12},
+    "Professional": {"rate": -8,  "pitch": -8},
     "Assistant":    {"rate": 0,   "pitch": 0},
-    "Storytelling": {"rate": -10, "pitch": 10},
+    "Storytelling": {"rate": -12, "pitch": 15},
 }
 
 # Age / voice-simulation presets: applied as a post-processing pitch+speed
@@ -109,12 +134,108 @@ AGE_EFFECTS = {
     "Mature":       0.85,
 }
 
+PITCH_CLAMP = (-150, 150)
+RATE_CLAMP = (-90, 100)
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# Local, offline "AI-style" emotion detection engine
+# (lexicon + punctuation heuristics -- free, no API key, no internet needed)
+# ---------------------------------------------------------------------------
+EMOTION_KEYWORDS = {
+    "Happy":    ["happy", "glad", "joy", "wonderful", "great", "love", "amazing",
+                 "delighted", "fantastic", "pleased", "awesome", "smile", "blessed"],
+    "Excited":  ["excited", "thrilled", "can't wait", "yay", "woohoo", "amazing",
+                 "incredible", "let's go", "finally"],
+    "Sad":      ["sad", "sorry", "unfortunately", "miss", "lonely", "cry", "upset",
+                 "heartbroken", "regret", "hurt", "disappointed", "grief"],
+    "Angry":    ["angry", "furious", "hate", "annoyed", "mad", "rage", "frustrat",
+                 "unacceptable", "outrageous", "disgust"],
+    "Fear":     ["afraid", "scared", "worried", "nervous", "fear", "anxious",
+                 "terrified", "panic", "danger", "threat"],
+    "Surprise": ["wow", "surprised", "shocking", "unbelievable", "suddenly",
+                 "astonishing", "no way", "really?"],
+}
+
+EMOTION_ADJUST = {
+    "Happy":    {"pitch": 18,  "rate": 10},
+    "Excited":  {"pitch": 28,  "rate": 18},
+    "Sad":      {"pitch": -20, "rate": -15},
+    "Angry":    {"pitch": -10, "rate": 15},
+    "Fear":     {"pitch": 15,  "rate": 12},
+    "Surprise": {"pitch": 30,  "rate": 8},
+    "Neutral":  {"pitch": 0,   "rate": 0},
+}
+
+EMOTION_EMOJI = {
+    "Happy": "😊", "Excited": "🤩", "Sad": "😢",
+    "Angry": "😠", "Fear": "😨", "Surprise": "😲", "Neutral": "🙂",
+}
+
+
+def split_sentences(text):
+    """Lightweight sentence splitter that keeps end punctuation for
+    emotion cues (works reasonably across all supported languages,
+    since Indic scripts also use '.', '!', '?', '।' as terminators)."""
+    text = text.strip()
+    if not text:
+        return []
+    parts = re.split(r'(?<=[.!?।])\s+|\n+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def analyze_emotion(sentence):
+    """Detect a dominant emotion for a sentence using free local heuristics:
+    keyword lexicon matches + punctuation/capitalization cues. This mimics
+    what an LLM sentiment pass would do, without needing any paid API."""
+    lower = sentence.lower()
+    scores = {emo: 0 for emo in EMOTION_ADJUST if emo != "Neutral"}
+
+    for emo, words in EMOTION_KEYWORDS.items():
+        for w in words:
+            if w in lower:
+                scores[emo] = scores.get(emo, 0) + 1
+
+    exclam = sentence.count("!")
+    quest = sentence.count("?")
+    has_ellipsis = "..." in sentence or sentence.rstrip().endswith("..")
+    words_only = re.sub(r'[^A-Za-z\s]', '', sentence)
+    is_shout = len(words_only) > 4 and words_only.isupper()
+
+    if exclam >= 1:
+        scores["Excited"] += exclam
+    if exclam >= 2 or is_shout:
+        scores["Angry"] += 1
+    if quest >= 1:
+        scores["Surprise"] += 1
+    if has_ellipsis:
+        scores["Sad"] += 1
+
+    best_emo = max(scores, key=scores.get)
+    if scores[best_emo] == 0:
+        return "Neutral"
+    return best_emo
+
+
+def combine_rate_pitch(base_rate, base_pitch, tone_label, emotion_label=None):
+    """Combine base speed/pitch + tone preset + (optional) detected-emotion
+    adjustment into final edge-tts rate/pitch strings, clamped to safe bounds."""
+    rate_val = RATE_MAP[base_rate] + TONE_ADJUST[tone_label]["rate"]
+    pitch_val = PITCH_MAP[base_pitch] + TONE_ADJUST[tone_label]["pitch"]
+
+    if emotion_label and emotion_label in EMOTION_ADJUST:
+        rate_val += EMOTION_ADJUST[emotion_label]["rate"]
+        pitch_val += EMOTION_ADJUST[emotion_label]["pitch"]
+
+    rate_val = max(RATE_CLAMP[0], min(RATE_CLAMP[1], rate_val))
+    pitch_val = max(PITCH_CLAMP[0], min(PITCH_CLAMP[1], pitch_val))
+
+    return f"{rate_val:+d}%", f"{pitch_val:+d}Hz"
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
 # ---------------------------------------------------------------------------
 def cleanup_old_files():
-    """Delete temp audio files older than FILE_MAX_AGE_SECONDS."""
     now = time.time()
     for f in TEMP_DIR.glob("*.mp3"):
         try:
@@ -124,18 +245,9 @@ def cleanup_old_files():
             pass
 
 
-def build_rate_pitch_strings(speed_label, pitch_label, tone_label):
-    """Combine speed + pitch + tone selections into edge-tts rate/pitch strings."""
-    rate_val = RATE_MAP[speed_label] + TONE_ADJUST[tone_label]["rate"]
-    pitch_val = PITCH_MAP[pitch_label] + TONE_ADJUST[tone_label]["pitch"]
-    # clamp to sane bounds
-    rate_val = max(-90, min(100, rate_val))
-    pitch_val = max(-100, min(100, pitch_val))
-    rate_str = f"{rate_val:+d}%"
-    pitch_str = f"{pitch_val:+d}Hz"
-    return rate_str, pitch_str
-
-
+# ---------------------------------------------------------------------------
+# Core TTS engines
+# ---------------------------------------------------------------------------
 async def _edge_tts_save(text, voice, rate_str, pitch_str, output_path):
     communicate = edge_tts.Communicate(text, voice=voice, rate=rate_str, pitch=pitch_str)
     await communicate.save(str(output_path))
@@ -147,7 +259,6 @@ def generate_with_edge_tts(text, voice, rate_str, pitch_str, output_path):
     asyncio.run(_edge_tts_save(text, voice, rate_str, pitch_str, output_path))
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError("edge-tts produced an empty file")
-    return "edge-tts"
 
 
 def generate_with_gtts(text, lang_code, output_path):
@@ -157,12 +268,9 @@ def generate_with_gtts(text, lang_code, output_path):
     tts.save(str(output_path))
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError("gTTS produced an empty file")
-    return "gTTS"
 
 
 def generate_with_pyttsx3(text, output_path):
-    """Offline fallback. Works best for English; quality/language support
-    depends entirely on voices installed on the host OS."""
     if not PYTTSX3_AVAILABLE:
         raise RuntimeError("pyttsx3 is not installed")
     wav_path = output_path.with_suffix(".wav")
@@ -171,28 +279,24 @@ def generate_with_pyttsx3(text, output_path):
     engine.runAndWait()
     if not wav_path.exists() or wav_path.stat().st_size == 0:
         raise RuntimeError("pyttsx3 produced an empty file")
-    # Convert wav -> mp3 if pydub/ffmpeg available, else keep wav.
     if PYDUB_AVAILABLE:
         try:
             sound = AudioSegment.from_wav(str(wav_path))
             sound.export(str(output_path), format="mp3")
             wav_path.unlink(missing_ok=True)
-            return "pyttsx3"
+            return
         except Exception:
             pass
-    # Could not convert - rename wav to the expected output name's stem.
     output_path.write_bytes(wav_path.read_bytes())
     wav_path.unlink(missing_ok=True)
-    return "pyttsx3 (wav)"
 
 
 def apply_age_effect(input_path, output_path, age_label):
-    """Post-process pitch/speed to simulate different age voices."""
     factor = AGE_EFFECTS.get(age_label, 1.0)
     if factor == 1.0 or not PYDUB_AVAILABLE:
         if input_path != output_path:
             output_path.write_bytes(input_path.read_bytes())
-        return False
+        return
     try:
         sound = AudioSegment.from_file(str(input_path), format="mp3")
         altered = sound._spawn(
@@ -201,55 +305,109 @@ def apply_age_effect(input_path, output_path, age_label):
         )
         altered = altered.set_frame_rate(44100)
         altered.export(str(output_path), format="mp3")
-        return True
     except Exception:
         if input_path != output_path:
             output_path.write_bytes(input_path.read_bytes())
-        return False
 
 
+# ---------------------------------------------------------------------------
+# Emotion-adaptive, per-sentence edge-tts synthesis (the "more human" path)
+# ---------------------------------------------------------------------------
+def generate_emotion_adaptive_edge_tts(text, voice, base_rate, base_pitch, tone_label,
+                                        output_path, progress_cb=None):
+    sentences = split_sentences(text)
+    if not sentences:
+        raise RuntimeError("No text to synthesize")
+
+    seg_paths = []
+    emotion_log = []
+    total = len(sentences)
+
+    for i, sentence in enumerate(sentences):
+        emotion = analyze_emotion(sentence)
+        emotion_log.append((sentence, emotion))
+        rate_str, pitch_str = combine_rate_pitch(base_rate, base_pitch, tone_label, emotion)
+
+        seg_path = TEMP_DIR / f"seg_{uuid.uuid4().hex[:8]}.mp3"
+        generate_with_edge_tts(sentence, voice, rate_str, pitch_str, seg_path)
+        seg_paths.append(seg_path)
+
+        if progress_cb:
+            pct = 20 + int(45 * (i + 1) / total)
+            progress_cb(pct, f"Analyzing emotion & synthesizing sentence {i + 1}/{total} "
+                              f"({EMOTION_EMOJI.get(emotion, '')} {emotion})...")
+
+    # Stitch all sentence clips together
+    if PYDUB_AVAILABLE:
+        combined = AudioSegment.silent(duration=0)
+        gap = AudioSegment.silent(duration=SENTENCE_GAP_MS)
+        for sp in seg_paths:
+            combined += AudioSegment.from_file(str(sp), format="mp3") + gap
+        combined.export(str(output_path), format="mp3")
+    else:
+        with open(output_path, "wb") as out:
+            for sp in seg_paths:
+                out.write(Path(sp).read_bytes())
+
+    for sp in seg_paths:
+        Path(sp).unlink(missing_ok=True)
+
+    return emotion_log
+
+
+# ---------------------------------------------------------------------------
+# Master conversion pipeline
+# ---------------------------------------------------------------------------
 def convert_text_to_speech(text, lang_code, gender, speed_label, pitch_label,
-                            tone_label, age_label, engine_choice, progress_cb=None):
+                            tone_label, age_label, engine_choice,
+                            emotion_adaptive, progress_cb=None):
     """
-    Master conversion pipeline with automatic engine fallback:
-    edge-tts -> gTTS -> pyttsx3
-    Returns (final_path, engine_used, warnings:list)
+    edge-tts (emotion-adaptive, per-sentence) -> edge-tts (flat) -> gTTS -> pyttsx3
+    Returns (final_path, engine_used, warnings:list, emotion_log:list|None)
     """
     warnings = []
     uid = uuid.uuid4().hex[:10]
     raw_path = TEMP_DIR / f"raw_{uid}.mp3"
     final_path = TEMP_DIR / f"tts_{uid}.mp3"
     engine_used = None
+    emotion_log = None
 
-    rate_str, pitch_str = build_rate_pitch_strings(speed_label, pitch_label, tone_label)
     voice = EDGE_VOICES.get(lang_code, {}).get(gender)
+    base_rate_str, base_pitch_str = combine_rate_pitch(speed_label, pitch_label, tone_label)
 
-    engines_to_try = []
-    if engine_choice == "Auto (Recommended)":
-        engines_to_try = ["edge-tts", "gTTS", "pyttsx3"]
-    else:
-        engines_to_try = [engine_choice]
+    engines_to_try = ["edge-tts", "gTTS", "pyttsx3"] if engine_choice == "Auto (Recommended)" else [engine_choice]
 
     if progress_cb:
-        progress_cb(10, "Preparing text...")
+        progress_cb(8, "Preparing text...")
 
     for eng in engines_to_try:
         try:
             if eng == "edge-tts":
-                if progress_cb:
-                    progress_cb(30, "Synthesizing with edge-tts neural voice...")
-                engine_used = generate_with_edge_tts(text, voice, rate_str, pitch_str, raw_path)
+                if emotion_adaptive:
+                    if progress_cb:
+                        progress_cb(15, "Running local AI emotion analysis...")
+                    emotion_log = generate_emotion_adaptive_edge_tts(
+                        text, voice, speed_label, pitch_label, tone_label, raw_path, progress_cb
+                    )
+                    engine_used = "edge-tts (emotion-adaptive)"
+                else:
+                    if progress_cb:
+                        progress_cb(35, "Synthesizing with edge-tts neural voice...")
+                    generate_with_edge_tts(text, voice, base_rate_str, base_pitch_str, raw_path)
+                    engine_used = "edge-tts"
                 break
             elif eng == "gTTS":
                 if progress_cb:
-                    progress_cb(30, "Synthesizing with gTTS (fallback)...")
-                engine_used = generate_with_gtts(text, GTTS_LANG_MAP.get(lang_code, "en"), raw_path)
-                warnings.append("Used gTTS fallback: pitch/speed/tone controls are limited with this engine.")
+                    progress_cb(35, "Synthesizing with gTTS (fallback)...")
+                generate_with_gtts(text, GTTS_LANG_MAP.get(lang_code, "en"), raw_path)
+                engine_used = "gTTS"
+                warnings.append("Used gTTS fallback: pitch/speed/tone/emotion controls are limited with this engine.")
                 break
             elif eng == "pyttsx3":
                 if progress_cb:
-                    progress_cb(30, "Synthesizing offline with pyttsx3 (fallback)...")
-                engine_used = generate_with_pyttsx3(text, raw_path)
+                    progress_cb(35, "Synthesizing offline with pyttsx3 (fallback)...")
+                generate_with_pyttsx3(text, raw_path)
+                engine_used = "pyttsx3"
                 warnings.append("Used pyttsx3 offline fallback: language support limited to installed system voices.")
                 break
         except Exception as e:
@@ -260,14 +418,48 @@ def convert_text_to_speech(text, lang_code, gender, speed_label, pitch_label,
         raise RuntimeError("All available TTS engines failed. " + " | ".join(warnings))
 
     if progress_cb:
-        progress_cb(70, "Applying voice simulation effects...")
+        progress_cb(85, "Applying voice simulation effects...")
     apply_age_effect(raw_path, final_path, age_label)
     raw_path.unlink(missing_ok=True)
 
     if progress_cb:
         progress_cb(100, "Done!")
 
-    return final_path, engine_used, warnings
+    return final_path, engine_used, warnings, emotion_log
+
+
+def generate_preview(lang_code, gender, speed_label, pitch_label, tone_label, age_label, engine_choice):
+    """Quick, flat (non-emotion) sample so the user can instantly hear the
+    selected voice/pitch/speed/tone combination before converting real text."""
+    sample_text = PREVIEW_TEXTS.get(lang_code, PREVIEW_TEXTS["en"])
+    uid = uuid.uuid4().hex[:8]
+    raw_path = TEMP_DIR / f"preview_raw_{uid}.mp3"
+    final_path = TEMP_DIR / f"preview_{uid}.mp3"
+
+    voice = EDGE_VOICES.get(lang_code, {}).get(gender)
+    rate_str, pitch_str = combine_rate_pitch(speed_label, pitch_label, tone_label)
+
+    engines_to_try = ["edge-tts", "gTTS", "pyttsx3"] if engine_choice == "Auto (Recommended)" else [engine_choice]
+    used = None
+    for eng in engines_to_try:
+        try:
+            if eng == "edge-tts":
+                generate_with_edge_tts(sample_text, voice, rate_str, pitch_str, raw_path)
+            elif eng == "gTTS":
+                generate_with_gtts(sample_text, GTTS_LANG_MAP.get(lang_code, "en"), raw_path)
+            elif eng == "pyttsx3":
+                generate_with_pyttsx3(sample_text, raw_path)
+            used = eng
+            break
+        except Exception:
+            continue
+
+    if used is None:
+        raise RuntimeError("Preview generation failed on all engines.")
+
+    apply_age_effect(raw_path, final_path, age_label)
+    raw_path.unlink(missing_ok=True)
+    return final_path, used
 
 
 # ---------------------------------------------------------------------------
@@ -280,23 +472,26 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- Minimal responsive / mobile-friendly styling ---
 st.markdown(
     """
     <style>
     .block-container { padding-top: 2rem; padding-bottom: 2rem; max-width: 1100px; }
     textarea { font-size: 16px !important; }
-    .stButton>button {
-        border-radius: 10px;
-        font-weight: 600;
-        padding: 0.5rem 1.2rem;
-    }
+    .stButton>button { border-radius: 10px; font-weight: 600; padding: 0.5rem 1.2rem; }
     .char-counter { color: #888; font-size: 0.85rem; text-align: right; }
     .history-card {
         border: 1px solid rgba(128,128,128,0.25);
         border-radius: 12px;
         padding: 0.8rem 1rem;
         margin-bottom: 0.6rem;
+    }
+    .emo-tag {
+        display: inline-block;
+        padding: 0.15rem 0.6rem;
+        border-radius: 999px;
+        background: rgba(128,128,128,0.15);
+        font-size: 0.8rem;
+        margin-bottom: 4px;
     }
     @media (max-width: 640px) {
         .block-container { padding-left: 0.6rem; padding-right: 0.6rem; }
@@ -309,13 +504,15 @@ st.markdown(
 if "text_input" not in st.session_state:
     st.session_state.text_input = ""
 if "history" not in st.session_state:
-    st.session_state.history = []  # list of dicts
+    st.session_state.history = []
+if "preview_audio" not in st.session_state:
+    st.session_state.preview_audio = None
 
 cleanup_old_files()
 
 st.title(APP_TITLE)
 st.caption(
-    "100% Free • No API Key • No Subscription • Runs Locally & on Streamlit Cloud — "
+    "100% Free • No API Key • No Subscription • Local AI Emotion-Adaptive Voice — "
     "powered by edge-tts, gTTS and pyttsx3."
 )
 
@@ -347,6 +544,20 @@ with st.sidebar:
     age_label = st.selectbox("Age effect", list(AGE_EFFECTS.keys()), index=2, label_visibility="collapsed")
 
     st.divider()
+    st.subheader("🧠 AI Emotion-Adaptive Voice")
+    emotion_adaptive = st.toggle(
+        "Auto-detect emotion per sentence",
+        value=True,
+        help=(
+            "Analyzes each sentence locally (keyword + punctuation based NLP — "
+            "free, offline, no API key) and automatically raises/lowers pitch & "
+            "speed to sound happy, sad, excited, angry, fearful or surprised, "
+            "instead of one flat robotic tone. Works best with edge-tts and "
+            "English text; other languages get punctuation-based cues."
+        ),
+    )
+
+    st.divider()
     st.subheader("🔧 Engine")
     engine_options = ["Auto (Recommended)"]
     if EDGE_TTS_AVAILABLE:
@@ -358,27 +569,39 @@ with st.sidebar:
     engine_choice = st.selectbox("TTS Engine", engine_options, index=0)
 
     st.caption(
-        "Auto mode tries **edge-tts** first (best quality, full pitch/speed control), "
+        "Auto mode tries **edge-tts** first (best quality, full pitch/speed/emotion control), "
         "then falls back to **gTTS**, then **pyttsx3** if needed."
     )
 
     if not PYDUB_AVAILABLE:
-        st.warning("pydub/ffmpeg not detected — voice-simulation pitch effects will be skipped.", icon="⚠️")
+        st.warning("pydub/ffmpeg not detected — pitch effects & sentence stitching quality will be reduced.", icon="⚠️")
+
+    st.divider()
+    if st.button("🔊 Preview Voice", use_container_width=True):
+        try:
+            with st.spinner("Generating preview..."):
+                prev_path, used_eng = generate_preview(
+                    lang_code, gender, speed_label, pitch_label, tone_label, age_label, engine_choice
+                )
+            st.session_state.preview_audio = prev_path.read_bytes()
+            st.caption(f"Preview engine: {used_eng}")
+        except Exception as e:
+            st.error(f"Preview failed: {e}")
+
+    if st.session_state.preview_audio:
+        st.audio(st.session_state.preview_audio, format="audio/mp3")
 
 # ---------------------------------------------------------------------------
 # Main - text input
 # ---------------------------------------------------------------------------
 col_left, col_right = st.columns([3, 1])
-
 with col_left:
     st.subheader("📝 Enter Text")
-
 with col_right:
     uploaded_file = st.file_uploader("📄 Upload .txt", type=["txt"], label_visibility="collapsed")
     if uploaded_file is not None:
         try:
-            content = uploaded_file.read().decode("utf-8", errors="ignore")
-            st.session_state.text_input = content
+            st.session_state.text_input = uploaded_file.read().decode("utf-8", errors="ignore")
         except Exception as e:
             st.error(f"Could not read file: {e}")
 
@@ -407,7 +630,6 @@ with meta_col3:
         st.rerun()
 
 st.divider()
-
 convert_col, _ = st.columns([1, 3])
 with convert_col:
     convert_clicked = st.button("🎧 Convert to MP3", type="primary", use_container_width=True)
@@ -426,14 +648,15 @@ if convert_clicked:
         status_placeholder = st.empty()
 
         def progress_cb(pct, msg):
-            progress_bar.progress(pct, text=msg)
+            progress_bar.progress(min(pct, 100), text=msg)
             status_placeholder.info(f"⏳ {msg}")
 
         try:
             with st.spinner("Generating audio, please wait..."):
-                final_path, engine_used, warns = convert_text_to_speech(
+                final_path, engine_used, warns, emotion_log = convert_text_to_speech(
                     clean_text, lang_code, gender, speed_label, pitch_label,
-                    tone_label, age_label, engine_choice, progress_cb=progress_cb,
+                    tone_label, age_label, engine_choice, emotion_adaptive,
+                    progress_cb=progress_cb,
                 )
 
             status_placeholder.empty()
@@ -454,7 +677,14 @@ if convert_clicked:
                 use_container_width=True,
             )
 
-            # Save to history
+            if emotion_log:
+                with st.expander("🧠 View Detected Emotion Per Sentence"):
+                    for sent, emo in emotion_log:
+                        st.markdown(
+                            f"<span class='emo-tag'>{EMOTION_EMOJI.get(emo, '')} {emo}</span> {sent}",
+                            unsafe_allow_html=True,
+                        )
+
             st.session_state.history.insert(0, {
                 "text_snippet": clean_text[:80] + ("..." if len(clean_text) > 80 else ""),
                 "file_path": str(final_path),
@@ -463,7 +693,7 @@ if convert_clicked:
                 "voice": gender,
                 "engine": engine_used,
             })
-            st.session_state.history = st.session_state.history[:15]  # keep last 15
+            st.session_state.history = st.session_state.history[:15]
 
         except Exception as e:
             status_placeholder.empty()
@@ -520,5 +750,6 @@ else:
 st.divider()
 st.caption(
     "Built with ❤️ using Streamlit, edge-tts, gTTS and pyttsx3 — no API keys, "
-    "no paid services, 100% free and open source."
+    "no paid services, 100% free and open source. Emotion analysis runs fully "
+    "locally using free NLP heuristics — no LLM API calls are made."
 )
